@@ -284,7 +284,10 @@ The two are deliberately separate, and neither feeds the other.
 covers waiting for a provider slot and then sitting QUEUED, and its timer is
 cleared the moment the job leaves QUEUED and starts executing
 (`rateLimitManager.ts`, `wrappedFn`). A request that exceeds it never reaches
-the upstream. Default 15000ms.
+the upstream. Default 30000ms, supplied by `DEFAULT_REQUEST_QUEUE_MAX_WAIT_MS`
+in `src/lib/resilience/settings.ts` and pinned by
+`tests/unit/ratelimit-admission-control-6593.test.ts`, so a change to it turns
+that test red rather than leaving this paragraph quietly stale.
 
 `resilienceSettings.requestQueue.executionMaxWaitMs` is what Bottleneck
 receives as the job `expiration`, whose timer starts only after dispatch. It is
