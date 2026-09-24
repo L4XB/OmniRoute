@@ -287,6 +287,63 @@ export async function readBoundedResponseText(
   return outcome.kind === "text" ? outcome.text : null;
 }
 
+/** The `getProviderCredentials` positional signature, as far as the retry uses it. */
+type RetryCredentialSelector = (
+  provider: string,
+  excludeConnectionId: string | null,
+  allowedConnections: string[] | null,
+  requestedModel: string | null
+) => Promise<unknown>;
+
+/**
+ * Credentials for the next empty-turn retry, or null when no connection can take
+ * it. A pinned connection (managed lease or `x-omniroute-connection`) is replayed
+ * as is: the lease fence refuses any other connection, and a pin is an operator
+ * instruction. Otherwise the connection that just returned the empty turn is
+ * excluded first; when nothing else is eligible the normal selection runs again,
+ * so a single slot still replays itself.
+ */
+export async function pickEmptyTurnRetryCredentials(
+  select: RetryCredentialSelector,
+  input: {
+    provider: string;
+    model: string | null;
+    current: Record<string, unknown>;
+    pinned: boolean;
+  }
+): Promise<Record<string, unknown> | null> {
+  if (input.pinned) return input.current;
+  const pick = async (excludeConnectionId: string | null) => {
+    const creds = asRecord(
+      await select(input.provider, excludeConnectionId, null, input.model).catch(() => null)
+    );
+    return creds?.connectionId ? creds : null;
+  };
+  const currentId =
+    typeof input.current.connectionId === "string" ? input.current.connectionId : null;
+  return (await pick(currentId)) ?? (currentId ? pick(null) : null);
+}
+
+/**
+ * Point `target` at `next` in place and return the undo. The retry has to run on
+ * the new credentials, but every fallback keeps the original response, and
+ * `target` must keep describing the connection that served it.
+ */
+export function swapCredentialsInPlace(
+  target: Record<string, unknown>,
+  next: Record<string, unknown>
+): () => void {
+  if (next === target) return () => undefined;
+  const previous = { ...target };
+  Object.assign(target, next);
+  return () => {
+    for (const key of Object.keys(target)) {
+      if (!Object.hasOwn(previous, key)) delete target[key];
+    }
+    Object.assign(target, previous);
+  };
+}
+
 type ProbeAccum = {
   state: Record<string, unknown>;
   forwardedValuableChunk: boolean;

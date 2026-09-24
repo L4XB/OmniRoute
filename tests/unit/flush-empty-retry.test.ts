@@ -8,6 +8,8 @@ const {
   readBoundedResponseOutcome,
   judgeBufferedTurn,
   FLUSH_EMPTY_RETRY_MAX_BYTES,
+  pickEmptyTurnRetryCredentials,
+  swapCredentialsInPlace,
 } = await import("../../open-sse/utils/emptyTurnRetry.ts");
 const { isEmptyTurnCore } = await import("../../open-sse/utils/streamEmptyChoices.ts");
 const { FORMATS } = await import("../../open-sse/translator/formats.ts");
@@ -260,4 +262,100 @@ test("bounded read keeps no budget when the idle budget is zero", async () => {
   const body = sse(chatChunk({ content: "hi" }));
   const out = await readBoundedResponseOutcome(new Response(body, { status: 200 }), 256_000, 0);
   assert.deepEqual(out, { kind: "text", text: body }, "a disabled budget must not change reads");
+});
+
+function recordingSelector(results: Record<string, unknown>) {
+  const calls: Array<string | null> = [];
+  const select = async (
+    _provider: string,
+    excludeConnectionId: string | null,
+    _allowed: string[] | null,
+    _model: string | null
+  ) => {
+    calls.push(excludeConnectionId);
+    return results[String(excludeConnectionId)] ?? null;
+  };
+  return { calls, select };
+}
+
+test("retry credentials exclude the connection that returned the empty turn", async () => {
+  const { calls, select } = recordingSelector({ "conn-a": { connectionId: "conn-b" } });
+  const next = await pickEmptyTurnRetryCredentials(select, {
+    provider: "gemini",
+    model: "gemini-2.5-flash",
+    current: { connectionId: "conn-a" },
+    pinned: false,
+  });
+  assert.deepEqual(next, { connectionId: "conn-b" });
+  assert.deepEqual(calls, ["conn-a"]);
+});
+
+test("retry credentials fall back to the normal selection when nothing else is eligible", async () => {
+  const { calls, select } = recordingSelector({
+    "conn-a": { allRateLimited: true, retryAfter: "later" },
+    null: { connectionId: "conn-a" },
+  });
+  const next = await pickEmptyTurnRetryCredentials(select, {
+    provider: "gemini",
+    model: "gemini-2.5-flash",
+    current: { connectionId: "conn-a" },
+    pinned: false,
+  });
+  assert.deepEqual(next, { connectionId: "conn-a" }, "a single slot replays itself");
+  assert.deepEqual(calls, ["conn-a", null]);
+});
+
+test("retry credentials are null when no selection yields a connection", async () => {
+  const { calls, select } = recordingSelector({});
+  const next = await pickEmptyTurnRetryCredentials(select, {
+    provider: "gemini",
+    model: null,
+    current: {},
+    pinned: false,
+  });
+  assert.equal(next, null);
+  assert.deepEqual(calls, [null], "without a current connection the selection runs once");
+  const failing = async () => {
+    throw new Error("selection failed");
+  };
+  const afterThrow = await pickEmptyTurnRetryCredentials(failing, {
+    provider: "gemini",
+    model: null,
+    current: { connectionId: "conn-a" },
+    pinned: false,
+  });
+  assert.equal(afterThrow, null);
+});
+
+test("a pinned connection is replayed without a selection", async () => {
+  const { calls, select } = recordingSelector({ "conn-a": { connectionId: "conn-b" } });
+  const current = { connectionId: "conn-a" };
+  const next = await pickEmptyTurnRetryCredentials(select, {
+    provider: "gemini",
+    model: null,
+    current,
+    pinned: true,
+  });
+  assert.equal(next, current);
+  assert.deepEqual(calls, []);
+});
+
+test("the credential swap undoes overwritten and added fields in place", () => {
+  const target: Record<string, unknown> = { connectionId: "conn-a", apiKey: "key-a" };
+  const restore = swapCredentialsInPlace(target, {
+    connectionId: "conn-b",
+    apiKey: "key-b",
+    projectId: "project-b",
+  });
+  assert.deepEqual(target, { connectionId: "conn-b", apiKey: "key-b", projectId: "project-b" });
+  restore();
+  assert.deepEqual(target, { connectionId: "conn-a", apiKey: "key-a" });
+});
+
+test("swapping credentials onto themselves is a no-op", () => {
+  const target: Record<string, unknown> = { connectionId: "conn-a" };
+  const restore = swapCredentialsInPlace(target, target);
+  target.accessToken = "refreshed";
+  restore();
+  assert.deepEqual(target, { connectionId: "conn-a", accessToken: "refreshed" });
 });
