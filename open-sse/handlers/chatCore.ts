@@ -5847,9 +5847,9 @@ export async function handleChatCore({
   // issue bounded retries through the normal credential path BEFORE anything is
   // exposed to the client — in particular before `onRequestSuccess` below.
   // Empty turns are stochastic upstream misses, not account faults, so no
-  // cooldown: the retry prefers another connection, a single slot simply
-  // replays the same account, and a pinned or leased connection never rotates
-  // (#14715). Budget: `STREAM_RECOVERY.EMPTY_TURN_RETRY_MAX` retries, then fall
+  // cooldown: the retry prefers another allowed connection, a single slot
+  // replays itself, and a leased or pinned connection never rotates (#14715).
+  // Budget: `STREAM_RECOVERY.EMPTY_TURN_RETRY_MAX` retries, then fall
   // back to the current behavior. Translate-path streams only (mirror of the
   // empty-stream guard); flag off = byte-for-byte unchanged. Bounded reader
   // (abandon past the cap, never a full `text()` read); the original
@@ -5902,7 +5902,9 @@ export async function handleChatCore({
           provider,
           model: currentModel,
           current: credentials,
-          pinned: Boolean(managedLease || forcedConnectionId),
+          leased: Boolean(managedLease),
+          forcedConnectionId,
+          apiKey: apiKeyInfo,
         });
         if (!nextCreds) break;
         const restoreCredentials = swapCredentialsInPlace(credentials, nextCreds);

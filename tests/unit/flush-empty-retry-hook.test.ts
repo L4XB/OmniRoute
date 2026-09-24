@@ -312,6 +312,24 @@ test("a failed retry logs the call against the connection that served it", async
   );
 });
 
+test("the retry stays inside the key's connection allowlist", async () => {
+  // Seeded first, so fill-first would pick it for an unrestricted selection.
+  await seedGemini("gemini-outside", "sk-flush-outside");
+  const first = await seedGemini("gemini-allowed-a", "sk-flush-allowed-a");
+  const second = await seedGemini("gemini-allowed-b", "sk-flush-allowed-b");
+  const key = await apiKeysDb.createApiKey("allowlisted-flush", "test", [], {
+    allowedConnections: [first.id, second.id],
+  });
+  const dispatches: string[] = [];
+  stubFetch(dispatches, (_auth, callIndex) =>
+    callIndex === 0 ? reasoningOnlyStreamResponse() : contentStreamResponse("served-after-retry")
+  );
+  const response = await handleChat(streamRequest({ Authorization: `Bearer ${key.key}` }));
+  const bodyText = await drainText(response);
+  assert.deepEqual(dispatches, [first.apiKey, second.apiKey]);
+  assert.match(bodyText, /served-after-retry/, "client must receive the retry content");
+});
+
 test("a pinned connection replays itself instead of rotating", async () => {
   await seedGemini("gemini-pin-a", "sk-flush-pin-a");
   const pinned = await seedGemini("gemini-pin-b", "sk-flush-pin-b");

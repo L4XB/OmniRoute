@@ -265,29 +265,31 @@ test("bounded read keeps no budget when the idle budget is zero", async () => {
 });
 
 function recordingSelector(results: Record<string, unknown>) {
-  const calls: Array<string | null> = [];
+  const calls: Array<{ exclude: string | null; allowed: string[] | null }> = [];
   const select = async (
     _provider: string,
     excludeConnectionId: string | null,
-    _allowed: string[] | null,
+    allowedConnections: string[] | null,
     _model: string | null
   ) => {
-    calls.push(excludeConnectionId);
+    calls.push({ exclude: excludeConnectionId, allowed: allowedConnections });
     return results[String(excludeConnectionId)] ?? null;
   };
   return { calls, select };
 }
 
+const unconstrained = { leased: false, forcedConnectionId: null, apiKey: null };
+
 test("retry credentials exclude the connection that returned the empty turn", async () => {
   const { calls, select } = recordingSelector({ "conn-a": { connectionId: "conn-b" } });
   const next = await pickEmptyTurnRetryCredentials(select, {
+    ...unconstrained,
     provider: "gemini",
     model: "gemini-2.5-flash",
     current: { connectionId: "conn-a" },
-    pinned: false,
   });
   assert.deepEqual(next, { connectionId: "conn-b" });
-  assert.deepEqual(calls, ["conn-a"]);
+  assert.deepEqual(calls, [{ exclude: "conn-a", allowed: null }]);
 });
 
 test("retry credentials fall back to the normal selection when nothing else is eligible", async () => {
@@ -296,48 +298,77 @@ test("retry credentials fall back to the normal selection when nothing else is e
     null: { connectionId: "conn-a" },
   });
   const next = await pickEmptyTurnRetryCredentials(select, {
+    ...unconstrained,
     provider: "gemini",
     model: "gemini-2.5-flash",
     current: { connectionId: "conn-a" },
-    pinned: false,
   });
   assert.deepEqual(next, { connectionId: "conn-a" }, "a single slot replays itself");
-  assert.deepEqual(calls, ["conn-a", null]);
+  assert.deepEqual(calls, [
+    { exclude: "conn-a", allowed: null },
+    { exclude: null, allowed: null },
+  ]);
+});
+
+test("both retry selections stay inside the key's connection allowlist", async () => {
+  const { calls, select } = recordingSelector({
+    "conn-a": { blockedByKeyPolicy: true, blockedCount: 1 },
+    null: { connectionId: "conn-a" },
+  });
+  const next = await pickEmptyTurnRetryCredentials(select, {
+    ...unconstrained,
+    apiKey: { allowedConnections: ["conn-a", 7, " "] },
+    provider: "gemini",
+    model: null,
+    current: { connectionId: "conn-a" },
+  });
+  assert.deepEqual(next, { connectionId: "conn-a" });
+  assert.deepEqual(calls, [
+    { exclude: "conn-a", allowed: ["conn-a"] },
+    { exclude: null, allowed: ["conn-a"] },
+  ]);
 });
 
 test("retry credentials are null when no selection yields a connection", async () => {
   const { calls, select } = recordingSelector({});
   const next = await pickEmptyTurnRetryCredentials(select, {
+    ...unconstrained,
     provider: "gemini",
     model: null,
     current: {},
-    pinned: false,
   });
   assert.equal(next, null);
-  assert.deepEqual(calls, [null], "without a current connection the selection runs once");
+  assert.deepEqual(calls, [{ exclude: null, allowed: null }], "no current connection: one pick");
   const failing = async () => {
     throw new Error("selection failed");
   };
   const afterThrow = await pickEmptyTurnRetryCredentials(failing, {
+    ...unconstrained,
     provider: "gemini",
     model: null,
     current: { connectionId: "conn-a" },
-    pinned: false,
   });
   assert.equal(afterThrow, null);
 });
 
-test("a pinned connection is replayed without a selection", async () => {
-  const { calls, select } = recordingSelector({ "conn-a": { connectionId: "conn-b" } });
-  const current = { connectionId: "conn-a" };
-  const next = await pickEmptyTurnRetryCredentials(select, {
-    provider: "gemini",
-    model: null,
-    current,
-    pinned: true,
-  });
-  assert.equal(next, current);
-  assert.deepEqual(calls, []);
+test("a lease, a pinned connection or a quota key replays without a selection", async () => {
+  const cases = [
+    { ...unconstrained, leased: true },
+    { ...unconstrained, forcedConnectionId: "conn-a" },
+    { ...unconstrained, apiKey: { allowedQuotas: ["pool-1"] } },
+  ];
+  for (const routing of cases) {
+    const { calls, select } = recordingSelector({ "conn-a": { connectionId: "conn-b" } });
+    const current = { connectionId: "conn-a" };
+    const next = await pickEmptyTurnRetryCredentials(select, {
+      ...routing,
+      provider: "gemini",
+      model: null,
+      current,
+    });
+    assert.equal(next, current, JSON.stringify(routing));
+    assert.deepEqual(calls, [], JSON.stringify(routing));
+  }
 });
 
 test("the credential swap undoes overwritten and added fields in place", () => {

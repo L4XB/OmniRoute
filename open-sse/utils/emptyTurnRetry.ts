@@ -295,27 +295,44 @@ type RetryCredentialSelector = (
   requestedModel: string | null
 ) => Promise<unknown>;
 
+/** The routing constraints of the original selection that the retry has to keep. */
+type RetryRouting = {
+  leased: boolean;
+  forcedConnectionId: string | null;
+  apiKey: { allowedConnections?: unknown; allowedQuotas?: unknown } | null;
+};
+
+function nonEmptyIds(value: unknown): string[] | null {
+  if (!Array.isArray(value)) return null;
+  const ids = value.filter((id): id is string => typeof id === "string" && id.trim().length > 0);
+  return ids.length > 0 ? ids : null;
+}
+
 /**
  * Credentials for the next empty-turn retry, or null when no connection can take
- * it. A pinned connection (managed lease or `x-omniroute-connection`) is replayed
- * as is: the lease fence refuses any other connection, and a pin is an operator
- * instruction. Otherwise the connection that just returned the empty turn is
- * excluded first; when nothing else is eligible the normal selection runs again,
- * so a single slot still replays itself.
+ * it. A managed lease, a pinned connection (`x-omniroute-connection` or a combo
+ * step pin) and a quota-scoped key (whose pool is not known here) replay the
+ * connection that served the turn: the lease fence refuses any other connection,
+ * and the others are routing constraints the retry must not escape. Otherwise
+ * the connection that just returned the empty turn is excluded first, inside the
+ * key's connection allowlist; when nothing else is eligible the normal selection
+ * runs again, so a single slot still replays itself.
  */
 export async function pickEmptyTurnRetryCredentials(
   select: RetryCredentialSelector,
-  input: {
+  input: RetryRouting & {
     provider: string;
     model: string | null;
     current: Record<string, unknown>;
-    pinned: boolean;
   }
 ): Promise<Record<string, unknown> | null> {
-  if (input.pinned) return input.current;
+  if (input.leased || input.forcedConnectionId || nonEmptyIds(input.apiKey?.allowedQuotas)) {
+    return input.current;
+  }
+  const allowed = nonEmptyIds(input.apiKey?.allowedConnections);
   const pick = async (excludeConnectionId: string | null) => {
     const creds = asRecord(
-      await select(input.provider, excludeConnectionId, null, input.model).catch(() => null)
+      await select(input.provider, excludeConnectionId, allowed, input.model).catch(() => null)
     );
     return creds?.connectionId ? creds : null;
   };
