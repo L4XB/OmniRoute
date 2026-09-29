@@ -4,6 +4,7 @@ import { hydrateConnectionProviderSpecificData } from "./compatibleNodeBaseUrl.t
 import { extractGoogApiKeyHeader } from "./googApiKeyAuth.ts";
 import { describeUpstreamFailure } from "@/shared/utils/upstreamError";
 import { buildAllExpiredCredentials } from "./authExpiredCredentials.ts";
+import { pickExpiryFirstConnection } from "./expiryFirstAccountSelection.ts";
 import {
   getCachedRawProviderConnections,
   getCachedProviderNodes,
@@ -37,6 +38,7 @@ import { isCommonChatGptWebRetiredProviderId } from "@/shared/constants/chatgptW
 import { toNumber } from "@/shared/utils/numeric";
 import { isMicrosoftDesignerWebRetiredProviderId } from "@/shared/constants/designerWebRetirement";
 import { isRuntimeRetiredProviderId } from "@/shared/constants/providerRetirement";
+import { allowlistPermitsSyntheticNoAuth } from "./noAuthAllowlist";
 import {
   createLazyConnectionView,
   toProviderConnection,
@@ -84,6 +86,7 @@ import { isOpencodeFreeTierRefusalForProvider } from "@omniroute/open-sse/execut
 import { isOpencodeFreeTierSkipped } from "@omniroute/open-sse/services/opencodeFreeTierSkip.ts";
 import { isLocalProvider } from "@omniroute/open-sse/config/providerRegistry.ts";
 import { COOLDOWN_MS, RateLimitReason } from "@omniroute/open-sse/config/constants.ts";
+import * as oauthAuthBackoff from "./oauthAuthFailureBackoff.ts";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/errorSanitization.ts";
 import {
   honorsRuleLockScope,
@@ -192,6 +195,7 @@ import {
   type CredentialLeaseSelectionContext,
 } from "./exclusiveConnectionLeasePolicy";
 import { readHeaderValue, type AuthRequestHeaders } from "./headerReader.ts";
+import { isSyntheticEmptyStreamFailure } from "./syntheticEmptyStream.ts";
 import {
   getOAuthSessionAvailability,
   reserveOAuthSession,
@@ -639,6 +643,7 @@ function compareP2CConnections(
  * exclude it (#3061), otherwise it gets re-selected forever.
  */
 const SYNTHETIC_NOAUTH_CONNECTION_ID = "noauth";
+
 type AnonymousFallbackProviderDefinition = {
   anonymousFallback?: boolean;
   noAuth?: boolean;
@@ -778,11 +783,9 @@ async function maybeSyntheticNoAuthFallback(
   allowedConnections: string[] | null = null
 ) {
   if (!providerCanUseSyntheticNoAuthFallback(providerId)) return null;
-  // #9057: a key pinned to specific connections via allowedConnections must
-  // NOT receive the synthetic "noauth" connection — the synthetic id is
-  // never in an explicit allowlist, so returning it would let a restricted
-  // key reach free providers (OpenCode Free, etc.) that it should not access.
-  if (Array.isArray(allowedConnections) && allowedConnections.length > 0) return null;
+  // #9057: a restricted key must NOT reach free providers (OpenCode Free, etc.) through the
+  // synthetic "noauth" connection unless its allowedConnections names it.
+  if (!allowlistPermitsSyntheticNoAuth(allowedConnections)) return null;
   if (excludedConnectionIds.has(SYNTHETIC_NOAUTH_CONNECTION_ID)) return null;
   // #14313: a free-tier refusal just paused this keyless path — do not re-select
   // the synthetic noauth connection until the short TTL expires.
@@ -1215,12 +1218,9 @@ export async function getProviderCredentials(
       ) {
         return optionalKey;
       }
-      // #9057: when allowedConnections is set, the synthetic "noauth" connection
-      // is never in the explicit allowlist, so we must NOT return it — fall through
-      // to the normal connection-selection path so the connection allowlist is
-      // respected (the no-auth provider will be rejected if it has no real connections
-      // matching the allowlist, or a real connection row will be selected if present).
-      if (!allowedConnections || allowedConnections.length === 0) {
+      // #9057: an allowlist that does not name "noauth" falls through to the normal
+      // connection-selection path so the allowlist is respected.
+      if (allowlistPermitsSyntheticNoAuth(allowedConnections)) {
         // #13483: check model-only lockout before handing back the synthetic
         // connection. Without this, a locked model (e.g. 400 model_capacity)
         // is retried on every request because the noauth path short-circuits
@@ -2102,7 +2102,7 @@ export async function getProviderCredentials(
       const idx =
         parseInt(randomUUID().replace(/-/g, "").substring(0, 8), 16) % orderedConnections.length;
       connection = orderedConnections[idx];
-    } else if (strategy === "least-used") {
+    } else if (strategy === "least-used" || strategy === "expiry-first") {
       // Least Used: pick the one with oldest lastUsedAt.
       // #12279: prefer accounts without backoff first, the same tie-break the
       // round-robin fallback branch applies. Without it the oldest lastUsedAt
@@ -2118,6 +2118,9 @@ export async function getProviderCredentials(
         return new Date(a.lastUsedAt).getTime() - new Date(b.lastUsedAt).getTime();
       });
       connection = sorted[0];
+      // expiry-first (#14533) ranks by the quota closest to being lost; see its leaf module.
+      if (strategy === "expiry-first")
+        connection = pickExpiryFirstConnection(orderedConnections, settings);
       // Record the use (#10945). This strategy sorts on the very field it was
       // not writing, so on a pool where every lastUsedAt is null the tie-break
       // fell through to `priority` and returned the SAME connection on every
@@ -3038,7 +3041,9 @@ export async function markAccountUnavailable(
       // combo-provider-cooldown-sibling.test.ts — "Gemini 503 should NOT skip
       // cooldown"). 502/503/504 keep the pre-#6216 model-lockout path: cooldownMs
       // 0 hot-loops the failing upstream (broke resilience-http-e2e on the PR).
-      if (status === 500) {
+      // The empty-stream 502 is synthesized by OmniRoute, not the provider: locking
+      // the model benched healthy accounts and emptied the combo (incident 2026-09-21).
+      if (status === 500 || isSyntheticEmptyStreamFailure(status, errorText)) {
         updateProviderConnection(connectionId, {
           lastErrorType: reason,
           lastError: `Model ${model} ${reason}`,
@@ -3212,17 +3217,30 @@ export async function markAccountUnavailable(
     ) {
       terminalStatus = null;
     }
+    // A known 5xx is a server failure, not a quota verdict (e.g. Cursor's empty-turn
+    // hint): never park it until a cached quota reset weeks away.
     const cachedQuotaResetAt =
-      providerErrorType === PROVIDER_ERROR_TYPES.QUOTA_EXHAUSTED ||
-      reason === RateLimitReason.QUOTA_EXHAUSTED
+      !(Number(status) >= 500) &&
+      (providerErrorType === PROVIDER_ERROR_TYPES.QUOTA_EXHAUSTED ||
+        reason === RateLimitReason.QUOTA_EXHAUSTED)
         ? getCachedQuotaResetAt(connectionId)
         : null;
     const cachedQuotaResetMs = parseFutureDateMs(cachedQuotaResetAt);
-    const cooldownMs = terminalStatus
+    const resolvedCooldownMs = terminalStatus
       ? 0
       : cachedQuotaResetMs
         ? cachedQuotaResetMs - Date.now()
         : rawCooldownMs;
+    const oauthAuthCooldownMs = oauthAuthBackoff.nextCooldownMs(connectionId, {
+      status,
+      authType: conn?.authType,
+      providerErrorType,
+      terminalStatus,
+      disableCooling,
+      resolvedCooldownMs,
+      baseCooldownMs: effectiveProviderProfile?.baseCooldownMs,
+    });
+    const cooldownMs = oauthAuthCooldownMs ?? resolvedCooldownMs;
 
     // ── #3027 / #12242 (402 variant): per-model subscription (403) or
     // per-model billing (402) error on a passthrough/gateway provider →
@@ -3376,7 +3394,7 @@ export async function markAccountUnavailable(
       await updateProviderConnection(connectionId, {
         ...baseUpdate,
         rateLimitedUntil: getUnavailableUntil(cooldownMs),
-        testStatus: "unavailable",
+        ...(oauthAuthCooldownMs === null ? { testStatus: "unavailable" } : {}),
       });
     } else {
       await updateProviderConnection(connectionId, {
@@ -3415,6 +3433,7 @@ export async function clearAccountError(
   connectionId: string,
   currentConnection: Partial<RecoverableConnectionState>
 ) {
+  oauthAuthBackoff.resetStreak(connectionId);
   // Only update if currently has error status
   const hasError =
     (currentConnection.testStatus && currentConnection.testStatus !== "active") ||
