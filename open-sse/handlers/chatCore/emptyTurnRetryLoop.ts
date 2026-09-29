@@ -157,7 +157,15 @@ async function attemptRetry(
     false
   );
 
-  const nextCreds = (await pickEmptyTurnRetryCredentials(getProviderCredentials, {
+  // A direct getProviderCredentials call (not a bare reference) keeps this site in the
+  // hard-session-lease inventory; the retry is fenced by executeProviderRequest().
+  const selectRetryCredentials = (
+    provider: string,
+    excludeConnectionId: string | null,
+    allowedConnections: string[] | null,
+    requestedModel: string | null
+  ) => getProviderCredentials(provider, excludeConnectionId, allowedConnections, requestedModel);
+  const nextCreds = (await pickEmptyTurnRetryCredentials(selectRetryCredentials, {
     ...(deps.routing ?? { leased: false, forcedConnectionId: null, apiKey: null }),
     provider: deps.provider,
     model: deps.currentModel,
